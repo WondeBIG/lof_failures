@@ -1,0 +1,179 @@
+WITH lof_issues AS (
+    -- Extract flight failure events and link them to affected rotables
+    SELECT DISTINCT 
+        ff.failure_time_utc, 
+        ff.request_type,  
+        ff.issue_type, 
+        ff.flight_id,
+        ff.issue_flight_failure_key,  
+        ff.issue_name,  
+        CASE 
+            WHEN ff.request_type = 'Recovery Failure' THEN 'Recovery'
+            WHEN ff.request_type = 'Launch Failure' THEN 'Launch Climb-Out'
+            ELSE ff.mission_stage  -- Assign appropriate mission stage for failure
+        END AS mission_stage,
+        ff.resolution_type,  
+        ff.failure_reason,
+
+        -- Determine whether the failure occurred inside or outside the hub
+        CASE 
+            WHEN mission_stage IN ('Delivery', 'Inbound', 'Outbound') THEN 'Outside'
+            WHEN mission_stage IN ('Launch Climb-Out', 'Recovery') THEN 'Inside'
+        END AS location_relative_to_hub,
+
+        -- Extract serial number from flight records or Jira issue data
+        COALESCE(rf.serial_number, je_serials.serial_number) AS serial_number,
+
+        -- Identify the source of the serial number (flight logs or ticket)
+        CASE 
+            WHEN rf.serial_number IS NULL THEN 'ticket'
+            ELSE 'flight'
+        END AS serial_source,
+
+        r.model,
+        ff.hub_id,  
+        ff.hub_name,
+        ff.osd_ticket,
+        ff.linked_tickets AS os_ticket,  
+
+        -- Assign vehicle number based on the type of failure event
+        CASE 
+            WHEN r.model = 'Body' THEN serial_number 
+            ELSE 'unknown vehicle'
+        END AS vehicle_number
+    FROM 
+        analytics.flight_failures ff
+    LEFT JOIN analytics.jira_issues je ON je.issue_key = ff.osd_ticket
+    LEFT JOIN (
+        -- Extract serial number from flight logs if available
+        SELECT DISTINCT 
+            top_parent_serial_number AS serial_number, 
+            flight_key 
+        FROM analytics.flight_serials 
+        WHERE top_parent_serial_number IS NOT NULL
+    ) rf ON rf.flight_key = ff.flight_key
+    LEFT JOIN (
+        -- Extract serial number from Jira issue data records if available
+        SELECT DISTINCT issue_key, serial_number FROM (
+            SELECT issue_key, battery_serial_number AS serial_number 
+            FROM analytics.jira_issues 
+            WHERE battery_serial_number IS NOT NULL
+            UNION ALL 
+            SELECT issue_key, wing_serial_number AS serial_number 
+            FROM analytics.jira_issues 
+            WHERE wing_serial_number IS NOT NULL
+            UNION ALL 
+            SELECT issue_key, body_serial_number AS serial_number 
+            FROM analytics.jira_issues 
+            WHERE body_serial_number IS NOT NULL
+        ) AS serials
+    ) je_serials ON je_serials.issue_key = ff.osd_ticket
+    AND rf.serial_number IS NULL
+    LEFT JOIN analytics.rotables r ON r.serial_number = COALESCE(rf.serial_number, je_serials.serial_number)
+),
+last_flight_records AS (
+    -- Extract last known flight for each lot to determine if last flight was reported LOF flight
+    SELECT DISTINCT 
+        s.lot_id,  
+        f.flight_id AS last_flight_id, 
+        f.hub_id AS last_hub_id,
+        f.health_facility_name AS last_delivery_site,  
+        f.priority, 
+        DATE_TRUNC('day', f.flight_launched_at) AS last_flight_day 
+    FROM 
+        analytics.flights f
+    LEFT JOIN analytics.flight_serials s ON f.flight_key = s.flight_key
+    QUALIFY RANK() OVER (PARTITION BY f.vehicle_number ORDER BY f.flight_launched_at DESC) = 1
+),
+swap_costs AS (
+    -- Capture component swaps, retirement status, and cost analysis
+    SELECT 
+        m.date_completed,  -- Date when the swap was completed
+        m.repair_id,  
+        f.id AS fleet_repair_id,  
+        m.child_part_name AS part_name,
+        m.child_part_number AS part_number,  
+        m.child_serial_number AS serial_number,
+        m.parent_serial_number AS parent,  
+        m.quantity,
+        m.source_stock_location,
+        m.destination_stock_location,  
+        s.destination_name AS final_destination,  -- Final destination of the component
+        l.last_flight_day,  -- Last known flight date before swap
+        l.last_flight_id,  -- Last flight ID before swap
+        l.last_delivery_site,  -- Last known delivery site
+        l.last_hub_id,  -- Last known hub id
+
+        -- Determine if the rotable was retired
+        CASE 
+            WHEN m.child_serial_number = parent THEN TRUE
+            ELSE FALSE
+        END AS rotable_retired,
+
+        -- Check for fuselage damage that required rebuilding
+        CASE 
+            WHEN m.child_part_name = 'LRU, ASSY, FUSE, SPARROW, COMPLETE' THEN 1
+            ELSE 0
+        END AS fuse_damaged,
+
+        -- Determine if the part was scrapped later
+        CASE 
+            WHEN m.destination_stock_location = s.source_complete_name 
+            AND s.destination_name = 'Scrap' THEN TRUE
+            ELSE FALSE
+        END AS scrapped_later,
+
+        -- Determine if the part was returned to the spares inventory
+        CASE 
+            WHEN m.destination_stock_location != 'Scrap' 
+            AND NOT scrapped_later THEN TRUE
+            ELSE FALSE
+        END AS returned_to_spares,
+
+        COALESCE(f.information, m.reasons) AS reason,  -- Capture reason for swap
+        v.name AS service_request_name,  -- Associated service request name
+
+        -- Determine cost values for the swapped parts
+        CASE 
+            WHEN rotable_retired = TRUE THEN 0
+            ELSE p.product_value
+        END AS unit_cost_value,
+        quantity * unit_cost_value AS total_cost_value,  -- Total cost impact
+
+        -- Extract associated Jira ticket
+        COALESCE(
+            CONCAT('OSD-', v.jira_ticket),
+            REGEXP_SUBSTR(UPPER(f.information), 'OSD-\\d+')
+        ) AS osd_ticket
+    FROM 
+        analytics.maintenance_swaps m
+    LEFT JOIN analytics.vehicle_services v ON m.parent_lot_id = v.lot_id
+    LEFT JOIN analytics.fleet_repair f ON f.id = m.repair_id
+    LEFT JOIN analytics.stock_moves s ON s.serial_num = m.child_serial_number
+    LEFT JOIN analytics.products p ON m.child_part_number = p.default_code
+    LEFT JOIN last_flight_records l ON l.lot_id = m.child_lot_id
+)
+-- Final Query: LOF Cost Impact Analysis
+SELECT 
+    l.failure_time_utc,
+    l.issue_flight_failure_key,
+    l.request_type,
+    l.resolution_type,
+    l.flight_id,
+    l.issue_name,
+    l.vehicle_number,
+    l.mission_stage,
+    l.serial_number,
+    l.model,
+    l.hub_name,
+    l.hub_id,
+    s.part_name,
+    s.part_number,
+    s.quantity,
+    s.unit_cost_value,
+    s.total_cost_value,
+    s.osd_ticket,
+    l.failure_reason
+FROM lof_issues l
+LEFT JOIN swap_costs s ON s.parent = l.serial_number
+ORDER BY l.failure_time_utc DESC
