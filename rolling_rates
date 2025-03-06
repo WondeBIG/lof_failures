@@ -1,0 +1,128 @@
+WITH days AS (
+    -- Generate a list of dates from 2018-01-01 to the current date
+    SELECT 
+        date_day AS date
+    FROM 
+        analytics.date_dimension
+    WHERE 
+        date_day >= '2018-01-01' 
+        AND date_day <= CURRENT_DATE()
+    ORDER BY 
+        date_day DESC
+),
+hubs AS (
+    -- Retrieve all hubs based on user selection or include all if not specified
+    SELECT DISTINCT 
+        hub_id,
+        hub_name,
+        country
+    FROM 
+        analytics.dim_hubs
+    WHERE 
+        hub_name IN ({{hub_name}})
+        OR hub_name IS NULL
+),
+all_dates_and_hubs AS (
+    -- Create a combination of all dates and hubs for a complete dataset
+    SELECT 
+        d.date,
+        h.hub_id,
+        h.hub_name,
+        h.country
+    FROM 
+        days d
+    CROSS JOIN 
+        hubs h
+),
+failures AS (
+    -- Aggregate incidents of Loss-of-Flight (LOF) failures by hub and date
+    SELECT 
+        DATE_TRUNC('DAY', failure_time_utc) AS date,
+        hub_id,
+        COUNT(DISTINCT issue_flight_failure_key) AS num_failures,
+        SUM(failure_cost) AS total_cost
+    FROM 
+        {{ failures_and_cost_analysis as lof}}
+    WHERE 
+        (hub_name IN ({{hub_name}}) OR hub_name IS NULL)
+        AND (incident_type IN ({{incident_type}}) OR incident_type IS NULL)
+        AND (os_ticket IN ({{os_ticket}}) OR os_ticket = '')
+    GROUP BY 
+        1, 2
+),
+flights AS (
+    -- Aggregate flights per hub and date
+    SELECT 
+        DATE_TRUNC('DAY', ff.time_launched) AS date,
+        hub_id,
+        COUNT(DISTINCT flight_key) AS num_flights
+    FROM 
+        analytics.flights ff
+    WHERE 
+        ff.time_launched >= '2018-01-01'
+    GROUP BY 
+        1, 2
+),
+joined AS (
+    -- Join flight and failure data with all date-hub combinations to ensure complete coverage
+    SELECT 
+        d.date,
+        d.hub_name,
+        d.country,
+        COALESCE(f.num_failures, 0) AS incidents,
+        COALESCE(f.total_cost, 0) AS cost_usd,
+        COALESCE(fl.num_flights, 0) AS flights
+    FROM 
+        all_dates_and_hubs d
+    LEFT JOIN 
+        flights fl ON fl.date = d.date AND fl.hub_id = d.hub_id
+    LEFT JOIN 
+        failures f ON f.date = d.date AND d.hub_id = f.hub_id
+),
+final_summary AS (
+    -- Compute rolling 30, 90, and 365-day windows for incidents and flights
+    SELECT 
+        date,
+        hub_name,
+        country,
+        CASE 
+            WHEN country = 'GH' THEN 'Ghana Hub'
+            WHEN country = 'NG' THEN 'Nigeria Hub'
+            WHEN country = 'RW' THEN 'Rwandan Hub'
+            ELSE 'Other Hubs'
+        END AS country_group,
+        incidents AS incidents_count,
+        flights AS flight_count,
+        SUM(incidents) OVER (
+            PARTITION BY hub_name 
+            ORDER BY date ROWS BETWEEN 30 PRECEDING AND CURRENT ROW
+        ) AS incident_30_days,
+        SUM(flights) OVER (
+            PARTITION BY hub_name 
+            ORDER BY date ROWS BETWEEN 30 PRECEDING AND CURRENT ROW
+        ) AS flights_30_days,
+        SUM(incidents) OVER (
+            PARTITION BY hub_name 
+            ORDER BY date ROWS BETWEEN 90 PRECEDING AND CURRENT ROW
+        ) AS incident_90_days,
+        SUM(flights) OVER (
+            PARTITION BY hub_name 
+            ORDER BY date ROWS BETWEEN 90 PRECEDING AND CURRENT ROW
+        ) AS flights_90_days,
+        SUM(incidents) OVER (
+            PARTITION BY hub_name 
+            ORDER BY date ROWS BETWEEN 365 PRECEDING AND CURRENT ROW
+        ) AS incident_365_days,
+        SUM(flights) OVER (
+            PARTITION BY hub_name 
+            ORDER BY date ROWS BETWEEN 365 PRECEDING AND CURRENT ROW
+        ) AS flights_365_days
+    FROM 
+        joined
+)
+SELECT 
+    * 
+FROM 
+    final_summary
+ORDER BY 
+    date DESC;
